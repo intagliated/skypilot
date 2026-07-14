@@ -21,6 +21,7 @@ import sky
 from sky import core
 from sky import exceptions
 from sky import global_user_state
+from sky import logs
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
@@ -49,6 +50,7 @@ from sky.utils import context
 from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
+from sky.utils import log_links
 from sky.utils import status_lib
 from sky.utils import ux_utils
 from sky.utils.plugin_extensions import ExternalClusterFailure
@@ -67,6 +69,13 @@ logger = sky_logging.init_logger('sky.jobs.controller')
 
 _background_tasks: Set[asyncio.Task] = set()
 _background_tasks_lock: asyncio.Lock = asyncio.Lock()
+
+# Live external-link polling cadence/cap. A matching URL is printed early in a
+# run, so we attempt extraction roughly once a minute and give up after a
+# bounded number of tries; the terminal-state log scan is the guarantee. This
+# bounds SSH round-trips on non-gRPC clusters (one job-queue read per attempt).
+_LIVE_LINK_POLL_EVERY = 4  # ~1 attempt per 4 status polls (~60s)
+_LIVE_LINK_MAX_ATTEMPTS = 30  # give up live updates after ~30 attempts
 
 
 async def create_background_task(coro: typing.Coroutine) -> None:
@@ -275,7 +284,24 @@ class JobController:
         We do not stream the logs from the cluster directly, as the
         download and stream should be faster, and more robust against
         preemptions or ssh disconnection during the streaming.
+
+        When a logging agent forwards the job's logs to an external store AND a
+        log reader is registered to stream them back, that external store is the
+        durable copy, so we skip pulling the logs back to the controller
+        entirely; ``sky jobs logs`` streams them on demand (from the cluster
+        while it is alive, then from the external store once it is gone). If the
+        logs are forwarded but there is no reader to read them back (e.g. a
+        write-only logging store), we still keep the local copy so ``sky jobs
+        logs`` can serve a finished job's logs.
         """
+        if (logs.is_logging_agent_configured() and
+                logs.get_log_reader() is not None):
+            logger.info(
+                f'Logging agent and log reader are configured for job '
+                f'{self._job_id}; logs are forwarded to the external store and '
+                'read back on demand. Skipping downloading and streaming the '
+                'logs to the controller.')
+            return
         if handle is None:
             logger.info(f'Cluster for job {self._job_id} is not found. '
                         'Skipping downloading and streaming the logs.')
@@ -295,6 +321,10 @@ class JobController:
             # completes.
             managed_job_state.set_local_log_file(self._job_id, task_id,
                                                  local_log_file)
+            # Scan the complete downloaded log for external links and persist
+            # them. The full log on local disk is the definitive source, so a
+            # link surfaces even if the user never streamed it.
+            self._extract_and_store_log_links(task_id, local_log_file)
 
         log_file = None
         if managed_job_runtime.is_registered():
@@ -316,6 +346,88 @@ class JobController:
                 f'task {task_id}')
 
         logger.info(f'\n== End of logs (ID: {self._job_id}) ==')
+
+    def _extract_and_store_log_links(self, task_id: Optional[int],
+                                     local_log_file: str) -> None:
+        """Scan a downloaded job log for external links and persist them.
+
+        Runs once per downloaded log (on every terminal-state and on-demand
+        download). Matching against the live ``dashboard.external_links`` config
+        happens here, in one place; the result is merged into ``spot.links``,
+        which the dashboard renders. Best-effort: never let it break the log
+        download path.
+        """
+        if task_id is None:
+            return
+        try:
+            patterns = log_links.get_patterns()
+            if not patterns:
+                return
+            if not local_log_file or not os.path.exists(local_log_file):
+                return
+            with open(local_log_file, 'r', encoding='utf-8',
+                      errors='replace') as f:
+                links = log_links.extract_links_from_lines(f, patterns)
+            if links:
+                managed_job_state.update_links(self._job_id, task_id, links)
+                logger.debug(f'Extracted external links from log: {links}')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                'Failed to extract external links from log file '
+                f'{local_log_file}: {common_utils.format_exception(e)}')
+
+    async def _update_live_log_links(self, task_id: Optional[int],
+                                     cluster_name: Optional[str],
+                                     job_id_on_pool_cluster: Optional[int],
+                                     found_labels: Set[str]) -> bool:
+        """Best-effort: surface external links from a running job's logs.
+
+        Reads candidate URLs harvested by the worker's skylet from job metadata
+        and matches them against the configured patterns here (one matcher, live
+        config), merging matches into ``spot.links``. The terminal-state scan is
+        the definitive backstop, so this only makes links appear sooner; any
+        failure is swallowed.
+
+        Returns True when there is nothing left to do (every configured pattern
+        has matched, or none are configured), so the caller can stop polling.
+        """
+        if task_id is None or cluster_name is None:
+            return True
+        try:
+            patterns = log_links.get_patterns()
+            if not patterns:
+                return True
+            if len(found_labels) >= len(patterns):
+                return True
+            handle = await asyncio.to_thread(
+                global_user_state.get_handle_from_cluster_name, cluster_name)
+            if handle is None:
+                return False
+            job_ids = ([job_id_on_pool_cluster]
+                       if job_id_on_pool_cluster is not None else None)
+            metadata_by_job = await asyncio.to_thread(
+                self._backend.get_job_metadata, handle, job_ids)
+            candidates: List[str] = []
+            for meta in metadata_by_job.values():
+                urls = meta.get(log_links.EXTRACTED_URLS_METADATA_KEY)
+                if isinstance(urls, list):
+                    candidates.extend(urls)
+            if candidates:
+                new_links = {
+                    label: url
+                    for label, url in log_links.match_links(
+                        candidates, patterns).items()
+                    if label not in found_labels
+                }
+                if new_links:
+                    await managed_job_state.update_links_async(
+                        self._job_id, task_id, new_links)
+                    found_labels.update(new_links.keys())
+            return len(found_labels) >= len(patterns)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug('Failed to update live external links: '
+                         f'{common_utils.format_exception(e)}')
+            return False
 
     async def _cleanup_cluster(self, cluster_name: Optional[str]) -> None:
         if cluster_name is None:
@@ -757,11 +869,22 @@ class JobController:
 
         transient_job_check_error_start_time = None
         job_check_backoff = None
+        # External-link labels already surfaced for this task, so we stop
+        # polling the worker's metadata once every pattern has matched.
+        live_link_labels: Set[str] = set()
+        live_link_done = False
+        live_link_attempts = 0
+        live_link_poll_counter = 0
 
         while True:
             # Get job status (skip on first iteration if forcing recovery)
             job_status = None
             transient_job_check_error_reason = None
+            # Per-node exit codes of the failed run, populated only when
+            # recovery is triggered by a job failure (not an infra-level
+            # failure like preemption). Reset each iteration so a stale
+            # value never leaks into the on_before_recovery hook.
+            exit_codes: Optional[List[int]] = None
 
             if not force_transit_to_recovering:
                 await asyncio.sleep(
@@ -798,6 +921,21 @@ class JobController:
                         f'Traceback: {traceback.format_exc()}')
                     # Fall through to recovery logic below
 
+                # While the job is running, surface external links harvested
+                # from its logs (best-effort; the terminal-state scan is the
+                # guarantee). Throttled and capped so a job that never prints a
+                # matching URL does not trigger a job-queue read on every poll
+                # (which is an SSH round-trip on non-gRPC clusters).
+                if (job_status is not None and not job_status.is_terminal() and
+                        not live_link_done and
+                        live_link_attempts < _LIVE_LINK_MAX_ATTEMPTS):
+                    live_link_poll_counter += 1
+                    if live_link_poll_counter % _LIVE_LINK_POLL_EVERY == 1:
+                        live_link_attempts += 1
+                        live_link_done = await self._update_live_log_links(
+                            task_id, cluster_name, job_id_on_pool_cluster,
+                            live_link_labels)
+
             # When job status check fails, we need to retry to avoid false alarm
             # for job failure, as it could be a transient error for
             # communication issue.
@@ -819,16 +957,9 @@ class JobController:
             if job_status == job_lib.JobStatus.SUCCEEDED:
                 logger.info(f'Task {task_id} succeeded! '
                             'Getting end time and cleaning up')
-                try:
-                    success_end_time = await asyncio.to_thread(
-                        managed_job_utils.try_to_get_job_end_time,
-                        self._backend, cluster_name, job_id_on_pool_cluster)
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(
-                        f'Failed to get job end time: '
-                        f'{common_utils.format_exception(e)}',
-                        exc_info=True)
-                    success_end_time = 0
+                success_end_time = await asyncio.to_thread(
+                    managed_job_utils.try_to_get_job_end_time, self._backend,
+                    cluster_name, job_id_on_pool_cluster)
 
                 # The job is done. Set the job to SUCCEEDED first before start
                 # downloading and streaming the logs to make it more responsive.
@@ -965,9 +1096,16 @@ class JobController:
                         'logs below.\n'
                         f'== Logs of the user job (ID: {self._job_id}) ==\n')
 
-                    await asyncio.to_thread(self.download_log_and_stream,
-                                            task_id, handle,
-                                            job_id_on_pool_cluster)
+                    try:
+                        await asyncio.to_thread(self.download_log_and_stream,
+                                                task_id, handle,
+                                                job_id_on_pool_cluster)
+                    except Exception as e:  # pylint: disable=broad-except
+                        # We don't want to crash here, so just log and continue.
+                        logger.warning(
+                            f'Failed to download and stream logs: '
+                            f'{common_utils.format_exception(e)}',
+                            exc_info=True)
 
                     failure_reason = (
                         'To see the details, run: '
@@ -979,12 +1117,20 @@ class JobController:
                         managed_job_status = (
                             managed_job_state.ManagedJobStatus.FAILED_SETUP)
                     elif job_status == job_lib.JobStatus.FAILED_DRIVER:
-                        # FAILED_DRIVER is kind of an internal error, so we mark
-                        # this as FAILED_CONTROLLER, even though the failure is
-                        # not strictly within the controller.
+                        # FAILED_DRIVER means the user job's driver process on
+                        # the remote cluster died, most commonly because the
+                        # user workload ran the node out of memory (e.g. a Ray
+                        # OutOfMemoryError). This is a failure of the user
+                        # workload, not of the jobs controller, so we classify
+                        # it as FAILED (not FAILED_CONTROLLER) to avoid firing
+                        # spurious controller-failure alerts. Like any other
+                        # user-job failure, whether it is retried is decided by
+                        # should_restart_on_failure() below (i.e. by
+                        # max_restarts_on_errors / recover_on_exit_codes), which
+                        # defaults to no retry -- appropriate here since an OOM
+                        # is deterministic and would likely recur on recovery.
                         managed_job_status = (
-                            managed_job_state.ManagedJobStatus.FAILED_CONTROLLER
-                        )
+                            managed_job_state.ManagedJobStatus.FAILED)
                         failure_reason = (
                             'The job driver on the remote cluster failed. This '
                             'can be caused by the job taking too much memory '
@@ -1087,6 +1233,19 @@ class JobController:
                             'unrecoverable error. Try to recover the job by'
                             ' restarting the job/cluster.')
 
+            # Before tearing down or relaunching, give the runtime a chance
+            # to capture the about-to-be-lost run's logs. Side-effecting
+            # and best-effort: a failure here must never block recovery.
+            if managed_job_runtime.is_registered():
+                try:
+                    await asyncio.to_thread(
+                        managed_job_runtime.on_before_recovery, handle,
+                        self._backend, self._job_id, task_id, exit_codes,
+                        job_id_on_pool_cluster)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning('on_before_recovery hook failed (continuing '
+                                   f'recovery): {e}')
+
             # When the handle is None, the cluster should be cleaned up already.
             if handle is not None:
                 resources = handle.launched_resources
@@ -1148,21 +1307,32 @@ class JobController:
             force_transit_to_recovering = False
 
     async def _prepare_job_group_task_for_launch(
-        self, task: 'sky.Task', task_id: int, job_group_name: str,
-        other_job_names: List[str]
+        self,
+        task: 'sky.Task',
+        task_id: int,
+        job_group_name: str,
+        other_job_names: List[str],
+        set_starting: bool = True,
     ) -> Tuple[str, recovery_strategy.StrategyExecutor]:
         """Prepare a JobGroup task for launch.
 
         This function:
         1. Injects a wait script to ensure networking is ready
         2. Creates the recovery strategy executor
-        3. Sets task state to STARTING
+        3. Sets task state to STARTING (only when ``set_starting`` is True)
 
         Args:
             task: Task to prepare.
             task_id: Task ID.
             job_group_name: JobGroup name.
             other_job_names: Other task names in the group (to wait for).
+            set_starting: Whether to transition the task to STARTING. Must be
+                False when resuming a task the controller was already running
+                before a restart: such a task is past PENDING, so the guarded
+                PENDING->STARTING update in set_starting matches no rows and
+                raises, wrongly failing the whole group as FAILED_CONTROLLER.
+                Mirrors the single-task path, which only sets STARTING when
+                ``not is_resume``.
 
         Returns:
             Tuple of (cluster_name, executor). cluster_name is always
@@ -1209,18 +1379,24 @@ class JobController:
             file_mounts_blob_id=managed_job_state.get_file_mounts_blob_id(
                 self._job_id))
 
-        callback_func = managed_job_utils.event_callback_func(
-            job_id=self._job_id, task_id=task_id, task=task)
-        resources_str = backend_utils.get_task_resources_str(
-            task, is_managed_job=True)
-        await managed_job_state.set_starting_async(
-            self._job_id,
-            task_id,
-            self._backend.run_timestamp,
-            time.time(),
-            resources_str=resources_str,
-            specs=_build_task_specs(executor),
-            callback_func=callback_func)
+        # Only transition to STARTING for a fresh launch. A resumed task is
+        # already past PENDING, so set_starting's guarded PENDING->STARTING
+        # update would match no rows and raise, wrongly failing the task as
+        # FAILED_CONTROLLER. The monitor loop drives state for resumed tasks
+        # via force_transit_to_recovering instead.
+        if set_starting:
+            callback_func = managed_job_utils.event_callback_func(
+                job_id=self._job_id, task_id=task_id, task=task)
+            resources_str = backend_utils.get_task_resources_str(
+                task, is_managed_job=True)
+            await managed_job_state.set_starting_async(
+                self._job_id,
+                task_id,
+                self._backend.run_timestamp,
+                time.time(),
+                resources_str=resources_str,
+                specs=_build_task_specs(executor),
+                callback_func=callback_func)
 
         return cluster_name, executor
 
@@ -1411,8 +1587,15 @@ class JobController:
 
                 # Get list of other job names (excluding current task)
                 other_job_names = [t.name for t in tasks if t.name != task.name]
+                # Only set STARTING for fresh launches (None/PENDING). Resumed
+                # tasks (STARTING/RUNNING/RECOVERING) are already past PENDING;
+                # re-issuing STARTING would fail the group as FAILED_CONTROLLER.
                 name, executor = await self._prepare_job_group_task_for_launch(
-                    task, task_id, job_group_name, other_job_names)
+                    task,
+                    task_id,
+                    job_group_name,
+                    other_job_names,
+                    set_starting=needs_launch(task_id))
                 cluster_names.append(name)
                 strategy_executors.append(executor)
 
@@ -2534,4 +2717,17 @@ async def main(controller_uuid: str):
 
 
 if __name__ == '__main__':
-    asyncio.run(main(sys.argv[1]))
+    # This file is launched as `python -u -m sky.jobs.controller <uuid>`, so
+    # runpy executes this module a second time under the name `__main__`,
+    # in addition to the normal import as `sky.jobs.controller`. That means
+    # every class and module-level function defined above (JobController,
+    # etc.) exists as two distinct objects in this process: the `__main__`
+    # copy and the imported-module copy. If we called the local `main()`
+    # here, everything it constructs would resolve against the `__main__`
+    # copy, so `mock.patch('sky.jobs.controller.JobController...')`,
+    # `isinstance`, and `pickle` would silently operate on the wrong class.
+    # Delegate to the imported module instead, so the process has a single
+    # identity for these classes. The import must stay local to this
+    # block -- at module scope it would be a self-import of this very file.
+    from sky.jobs import controller as _controller
+    asyncio.run(_controller.main(sys.argv[1]))
